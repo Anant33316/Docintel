@@ -1,0 +1,622 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Serverless AI-powered document intelligence (S3 -> SQS -> Lambda -> Textract/Comprehend/Bedrock -> DynamoDB -> API).
+  v2 adds comparison, chat history, confidence scoring + human review, PII redaction, cross-document search,
+  analytics, key-date extraction, source-grounded answers, exports and an audit trail.
+
+Parameters:
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-3-haiku-20240307-v1:0
+    Description: Bedrock model/inference-profile ID. Must have model access enabled in your region.
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional email for alarm notifications.
+  ClassifierEndpointArn:
+    Type: String
+    Default: ''
+    Description: Optional Comprehend custom classifier endpoint ARN. If empty, the LLM classifies the document.
+  EmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+    Description: >-
+      Bedrock embedding model for semantic retrieval/search (enable model access first).
+      Set to an empty string to use lexical (BM25) retrieval only.
+  ConfidenceThreshold:
+    Type: Number
+    Default: 90
+    MinValue: 0
+    MaxValue: 100
+    Description: Extracted fields with Textract confidence below this percentage are marked REQUIRES_REVIEW.
+  ChatHistoryTtlDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: Chat messages are deleted automatically (DynamoDB TTL) after this many days.
+  AuditRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 30
+    Description: Audit events are deleted automatically (DynamoDB TTL) after this many days.
+  CorsAllowedOrigin:
+    Type: String
+    Default: '*'
+    Description: Origin allowed to call the API from a browser (e.g. https://your-frontend.example). '*' for development.
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Tracing: Active
+    MemorySize: 512
+    Layers: [!Ref SharedLayer]
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref DocsTable
+        APP_TABLE_NAME: !Ref AppTable
+        CHUNKS_TABLE_NAME: !Ref ChunksTable
+        BUCKET_NAME: !Sub '${AWS::StackName}-docs-${AWS::AccountId}'
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        EMBEDDING_MODEL_ID: !Ref EmbeddingModelId
+        CONFIDENCE_THRESHOLD: !Ref ConfidenceThreshold
+        CHAT_HISTORY_TTL_DAYS: !Ref ChatHistoryTtlDays
+        AUDIT_TTL_DAYS: !Ref AuditRetentionDays
+        CORS_ALLOWED_ORIGIN: !Ref CorsAllowedOrigin
+        HIGH_VALUE_THRESHOLD: '10000'
+
+Resources:
+  # ---------- Shared code (layer) ----------
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-shared'
+      Description: docintel_common - retrieval, grounding, audit, PII, review and AWS helpers
+      ContentUri: src/shared/
+      CompatibleRuntimes: [python3.12]
+      CompatibleArchitectures: [arm64]
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: python3.12
+      BuildArchitecture: arm64
+
+  # ---------- Storage ----------
+  DocsBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: QueuePolicy
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-docs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT, GET]
+            AllowedOrigins: [!Ref CorsAllowedOrigin]
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-uploads
+            Status: Enabled
+            Prefix: uploads/
+            ExpirationInDays: 90
+          - Id: expire-exports          # exports are re-generatable on demand
+            Status: Enabled
+            Prefix: exports/
+            ExpirationInDays: 7
+          - Id: expire-redacted
+            Status: Enabled
+            Prefix: redacted/
+            ExpirationInDays: 90
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Queue: !GetAtt IngestQueue.Arn
+            Filter:            # only uploads/ triggers processing; results/, redacted/, exports/ never do
+              S3Key:
+                Rules:
+                  - {Name: prefix, Value: uploads/}
+
+  BucketSecureTransport:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DocsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt DocsBucket.Arn
+              - !Sub '${DocsBucket.Arn}/*'
+            Condition:
+              Bool: {'aws:SecureTransport': 'false'}
+
+  DocsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: docId, AttributeType: S}
+      KeySchema:
+        - {AttributeName: docId, KeyType: HASH}
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  # Single-table store for everything that is not a document: chat sessions/messages,
+  # comparisons, verification trail, redaction metadata, audit events, dashboard counters.
+  AppTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+        - {AttributeName: gsi1pk, AttributeType: S}
+        - {AttributeName: gsi1sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1            # audit events by day
+          KeySchema:
+            - {AttributeName: gsi1pk, KeyType: HASH}
+            - {AttributeName: gsi1sk, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification: {AttributeName: expiresAt, Enabled: true}
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  # Retrieval index: page-aware text chunks (+ optional embedding vectors). Derived data,
+  # rebuildable by reprocessing, so no point-in-time recovery.
+  ChunksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: docId, AttributeType: S}
+        - {AttributeName: chunkId, AttributeType: S}
+      KeySchema:
+        - {AttributeName: docId, KeyType: HASH}
+        - {AttributeName: chunkId, KeyType: RANGE}
+      SSESpecification: {SSEEnabled: true}
+
+  # ---------- Messaging (loose coupling + reliability) ----------
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 5400   # >= 6x processor timeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref IngestQueue]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: s3.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt IngestQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${AWS::StackName}-docs-${AWS::AccountId}'
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # ---------- Compute ----------
+  ProcessorLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-processor'
+      RetentionInDays: 30
+
+  ApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-api'
+      RetentionInDays: 30
+
+  PrivacyLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-privacy'
+      RetentionInDays: 30
+
+  ExportLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-export'
+      RetentionInDays: 30
+
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ProcessorLogs
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-processor'
+      CodeUri: src/processor/
+      Handler: app.handler
+      Timeout: 900
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 5   # protects Textract/Bedrock quotas and your wallet
+      Environment:
+        Variables:
+          CLASSIFIER_ENDPOINT_ARN: !Ref ClassifierEndpointArn
+          BEDROCK_READ_TIMEOUT: '120'
+      Policies:
+        - SQSPollerPolicy: {QueueName: !GetAtt IngestQueue.QueueName}
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${DocsBucket.Arn}/uploads/*'
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${DocsBucket.Arn}/results/*'
+            - Effect: Allow
+              Action: [textract:AnalyzeDocument, textract:StartDocumentAnalysis, textract:GetDocumentAnalysis]
+              Resource: '*'
+            - Effect: Allow
+              Action: [comprehend:DetectEntities, comprehend:DetectKeyPhrases, comprehend:DetectDominantLanguage, comprehend:ClassifyDocument]
+              Resource: '*'
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*'
+            - Effect: Allow                       # retrieval index
+              Action: [dynamodb:Query, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:BatchWriteItem]
+              Resource: !GetAtt ChunksTable.Arn
+            - Effect: Allow                       # audit events + dashboard counters
+              Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+              Resource: !GetAtt AppTable.Arn
+        - DynamoDBCrudPolicy: {TableName: !Ref DocsTable}
+      Events:
+        Ingest:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IngestQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig: {MaximumConcurrency: 5}
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ApiLogs
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-api'
+      CodeUri: src/api/
+      Handler: app.handler
+      Timeout: 60
+      MemorySize: 1024            # faster BM25/JSON work for search and chat (still pay-per-ms)
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${DocsBucket.Arn}/uploads/*'
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${DocsBucket.Arn}/results/*'
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*'
+            - Effect: Allow             # read documents; UpdateItem only for human verifications
+              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:Scan, dynamodb:UpdateItem]
+              Resource: !GetAtt DocsTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:Query, dynamodb:Scan]
+              Resource: !GetAtt ChunksTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem,
+                       dynamodb:Query, dynamodb:BatchWriteItem]
+              Resource:
+                - !GetAtt AppTable.Arn
+                - !Sub '${AppTable.Arn}/index/*'
+      Events:
+        UploadUrl:      {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: /documents/upload-url, Method: POST}}
+        List:           {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: /documents, Method: GET}}
+        Get:            {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}', Method: GET}}
+        Ask:            {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/ask', Method: POST}}
+        Chat:           {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/chat', Method: POST}}
+        ChatSessions:   {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/chat', Method: GET}}
+        ChatHistory:    {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/chat/{sessionId}', Method: GET}}
+        ChatDelete:     {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/chat/{sessionId}', Method: DELETE}}
+        Fields:         {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/fields', Method: GET}}
+        VerifyField:    {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/fields/{fieldId}/verify', Method: POST}}
+        Verifications:  {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/verifications', Method: GET}}
+        Compare:        {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: /compare, Method: POST}}
+        GetComparison:  {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/comparisons/{comparisonId}', Method: GET}}
+        DocComparisons: {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/comparisons', Method: GET}}
+        Search:         {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: /search, Method: GET}}
+        Stats:          {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: /stats, Method: GET}}
+        DocAudit:       {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/audit', Method: GET}}
+        AuditByDay:     {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: /audit, Method: GET}}
+        Invoice:        {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/invoice', Method: GET}}
+        Anomalies:      {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: /anomalies, Method: GET}}
+        ReviewFinding:  {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/anomalies/{findingId}/review', Method: POST}}
+        Versions:       {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/versions', Method: GET}}
+        LinkVersion:    {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/versions', Method: POST}}
+
+  # PII lives in its own function: the only role with comprehend:DetectPiiEntities and write access to redacted/
+  PrivacyFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: PrivacyLogs
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-privacy'
+      CodeUri: src/privacy/
+      Handler: app.handler
+      Timeout: 60
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub '${DocsBucket.Arn}/results/*'
+                - !Sub '${DocsBucket.Arn}/redacted/*'     # needed to presign downloads
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${DocsBucket.Arn}/redacted/*'
+            - Effect: Allow
+              Action: comprehend:DetectPiiEntities
+              Resource: '*'                                   # Comprehend detect APIs have no resource-level ARNs
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt DocsTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
+              Resource: !GetAtt AppTable.Arn
+      Events:
+        DetectPii:   {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/pii', Method: POST}}
+        Redact:      {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/redact', Method: POST}}
+        Redactions:  {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/redactions', Method: GET}}
+
+  ExportFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ExportLogs
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-export'
+      CodeUri: src/export/
+      Handler: app.handler
+      Timeout: 60
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub '${DocsBucket.Arn}/results/*'
+                - !Sub '${DocsBucket.Arn}/exports/*'
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${DocsBucket.Arn}/exports/*'
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !GetAtt DocsTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+              Resource: !GetAtt AppTable.Arn
+      Events:
+        Export: {Type: Api, Properties: {RestApiId: !Ref DocApi, Path: '/documents/{docId}/export', Method: GET}}
+
+  DocApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Ref AWS::StackName
+      StageName: prod
+      TracingEnabled: true
+      MethodSettings:
+        - {ResourcePath: '/*', HttpMethod: '*', MetricsEnabled: true, ThrottlingBurstLimit: 20, ThrottlingRateLimit: 10}
+      Cors:
+        AllowMethods: "'GET,POST,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Api-Key,X-User-Id'"
+        AllowOrigin: !Sub "'${CorsAllowedOrigin}'"
+        MaxAge: "'600'"
+      GatewayResponses:            # CORS headers on API Gateway's own errors (bad key, throttling)
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${CorsAllowedOrigin}'"
+              Access-Control-Allow-Headers: "'Content-Type,X-Api-Key,X-User-Id'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${CorsAllowedOrigin}'"
+      Auth:
+        ApiKeyRequired: true
+        AddApiKeyRequiredToCorsPreflight: false      # browsers send OPTIONS without custom headers
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          UsagePlanName: !Sub '${AWS::StackName}-plan'
+          Throttle: {BurstLimit: 20, RateLimit: 10}
+          Quota: {Limit: 5000, Period: DAY}
+
+  # ---------- Observability ----------
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  DlqNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Documents failed processing 3 times and landed in the DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt DeadLetterQueue.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  ProcessorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Processor Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref ProcessorFunction}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  ApiErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: API Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref ApiFunction}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  PrivacyErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Privacy (PII/redaction) Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref PrivacyFunction}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  ExportErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Export Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref ExportFunction}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # Audit writes are best-effort; failures are logged and surfaced through this metric + alarm.
+  AuditFailuresProcessorFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ProcessorLogs
+      FilterPattern: '"audit write failed"'
+      MetricTransformations: [{MetricNamespace: !Sub '${AWS::StackName}/DocIntel', MetricName: AuditWriteFailures, MetricValue: '1', DefaultValue: 0}]
+
+  AuditFailuresApiFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApiLogs
+      FilterPattern: '"audit write failed"'
+      MetricTransformations: [{MetricNamespace: !Sub '${AWS::StackName}/DocIntel', MetricName: AuditWriteFailures, MetricValue: '1', DefaultValue: 0}]
+
+  AuditFailuresPrivacyFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref PrivacyLogs
+      FilterPattern: '"audit write failed"'
+      MetricTransformations: [{MetricNamespace: !Sub '${AWS::StackName}/DocIntel', MetricName: AuditWriteFailures, MetricValue: '1', DefaultValue: 0}]
+
+  AuditFailuresExportFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ExportLogs
+      FilterPattern: '"audit write failed"'
+      MetricTransformations: [{MetricNamespace: !Sub '${AWS::StackName}/DocIntel', MetricName: AuditWriteFailures, MetricValue: '1', DefaultValue: 0}]
+
+  AuditWriteFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Audit events could not be written to DynamoDB
+      Namespace: !Sub '${AWS::StackName}/DocIntel'
+      MetricName: AuditWriteFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-overview'
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Processor invocations / errors","region":"${AWS::Region}","stat":"Sum","period":300,
+            "metrics":[["AWS/Lambda","Invocations","FunctionName","${ProcessorFunction}"],[".","Errors",".","."]]}},
+          {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Processor duration (p90 ms)","region":"${AWS::Region}","stat":"p90","period":300,
+            "metrics":[["AWS/Lambda","Duration","FunctionName","${ProcessorFunction}"]]}},
+          {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"Queue depth / DLQ","region":"${AWS::Region}","stat":"Maximum","period":60,
+            "metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${IngestQueue.QueueName}"],[".",".",".","${DeadLetterQueue.QueueName}"]]}},
+          {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"API 4xx / 5xx","region":"${AWS::Region}","stat":"Sum","period":300,
+            "metrics":[["AWS/ApiGateway","4XXError","ApiName","${AWS::StackName}"],[".","5XXError",".","."]]}},
+          {"type":"metric","x":0,"y":12,"width":12,"height":6,"properties":{"title":"API / privacy / export errors","region":"${AWS::Region}","stat":"Sum","period":300,
+            "metrics":[["AWS/Lambda","Errors","FunctionName","${ApiFunction}"],["...","${PrivacyFunction}"],["...","${ExportFunction}"]]}},
+          {"type":"metric","x":12,"y":12,"width":12,"height":6,"properties":{"title":"Bedrock tokens (model ${BedrockModelId})","region":"${AWS::Region}","stat":"Sum","period":3600,
+            "metrics":[["AWS/Bedrock","InputTokenCount","ModelId","${BedrockModelId}"],[".","OutputTokenCount",".","."]]}},
+          {"type":"metric","x":0,"y":18,"width":12,"height":6,"properties":{"title":"API latency (p90 ms)","region":"${AWS::Region}","stat":"p90","period":300,
+            "metrics":[["AWS/Lambda","Duration","FunctionName","${ApiFunction}"],["...","${PrivacyFunction}"],["...","${ExportFunction}"]]}},
+          {"type":"metric","x":12,"y":18,"width":12,"height":6,"properties":{"title":"Audit write failures","region":"${AWS::Region}","stat":"Sum","period":300,
+            "metrics":[["${AWS::StackName}/DocIntel","AuditWriteFailures"]]}}
+        ]}
+
+Outputs:
+  ApiUrl:
+    Value: !Sub 'https://${DocApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  ApiKeyId:
+    Description: Fetch the key value with `aws apigateway get-api-key --api-key <id> --include-value`
+    Value: !Ref DocApiApiKey
+  BucketName:
+    Value: !Ref DocsBucket
+  DlqUrl:
+    Value: !Ref DeadLetterQueue
+  DocsTableName:
+    Value: !Ref DocsTable
+  AppTableName:
+    Value: !Ref AppTable
+  ChunksTableName:
+    Value: !Ref ChunksTable

@@ -1,0 +1,2 @@
+# The shared layer only uses the Python standard library and boto3/botocore,
+# which the Lambda python3.12 runtime already provides. Intentionally empty.

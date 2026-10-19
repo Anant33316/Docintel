@@ -1,0 +1,4 @@
+# Keep text files UTF-8 with LF endings so Windows editors cannot reintroduce mojibake/CRLF in the frontend.
+* text=auto eol=lf
+*.pdf binary
+*.png binary

@@ -1,0 +1,6 @@
+# Local demo server (python local_server.py). No AWS packages or credentials needed.
+fastapi>=0.110
+uvicorn>=0.29
+pymupdf==1.28.2        # PDF text extraction for uploads (the server still starts without it; uploads are then refused)
+pytest>=8              # to run the test suite
+pyyaml>=6              # tests/test_template.py

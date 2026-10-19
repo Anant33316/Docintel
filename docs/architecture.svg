@@ -1,0 +1,157 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800" width="1200" height="800" font-family="Helvetica, Arial, sans-serif">
+  <title>DocIntel v2 serverless architecture</title>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#4a5363"/>
+    </marker>
+    <marker id="ahE" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#d9480f"/>
+    </marker>
+    <style>
+      .t { font-size: 13px; fill: #1d2330; font-weight: 700; }
+      .s { font-size: 11px; fill: #3d4553; }
+      .cap { font-size: 11px; fill: #6b7685; font-weight: 700; letter-spacing: .08em; }
+      .ln { stroke: #4a5363; stroke-width: 1.6; fill: none; marker-end: url(#ah); }
+      .ev { stroke: #d9480f; stroke-width: 2; fill: none; marker-end: url(#ahE); }
+      .big { stroke: #4a5363; stroke-width: 3; fill: none; marker-end: url(#ah); marker-start: url(#ah); }
+      .edge { fill: #fdeef4; stroke: #c2417a; }
+      .cmp { fill: #fff3e4; stroke: #e8891c; }
+      .ai { fill: #f1edfd; stroke: #7552d6; }
+      .data { fill: #e9f6ee; stroke: #2e9a5b; }
+      .ops { fill: #eef1f5; stroke: #6b7685; }
+      .grp { fill: none; stroke-dasharray: 5 4; }
+      rect { stroke-width: 1.4; }
+    </style>
+  </defs>
+  <rect x="0" y="0" width="1200" height="800" fill="#ffffff"/>
+  <text x="40" y="36" font-size="20" font-weight="700" fill="#1d2330">DocIntel v2 — serverless, event-driven document intelligence on AWS</text>
+
+  <!-- Band A: clients -->
+  <text class="cap" x="40" y="66">CLIENTS</text>
+  <rect class="edge" x="300" y="74" width="600" height="56" rx="10" fill-opacity=".5"/>
+  <text class="t" x="600" y="98" text-anchor="middle">Browser console (frontend/index.html) · scripts/demo.py · any HTTPS client</text>
+  <text class="s" x="600" y="117" text-anchor="middle">x-api-key on every call · optional X-User-Id for chat ownership and audit</text>
+
+  <!-- Band B: edge -->
+  <text class="cap" x="40" y="160">EDGE</text>
+  <rect class="edge" x="40" y="168" width="460" height="64" rx="10"/>
+  <text class="t" x="270" y="193" text-anchor="middle">S3 presigned URLs (5 min)</text>
+  <text class="s" x="270" y="213" text-anchor="middle">PUT upload to uploads/ · GET redacted copies and exports</text>
+  <rect class="edge" x="540" y="168" width="620" height="64" rx="10"/>
+  <text class="t" x="850" y="193" text-anchor="middle">Amazon API Gateway (REST)</text>
+  <text class="s" x="850" y="213" text-anchor="middle">API key + usage plan · throttling 10 rps / burst 20 · CORS · X-Ray</text>
+  <path class="ln" d="M450,130 L330,166"/>
+  <path class="ln" d="M750,130 L830,166"/>
+
+  <!-- Band C: compute -->
+  <text class="cap" x="40" y="266">COMPUTE — AWS LAMBDA (PYTHON 3.12, ARM64) + SHARED LAYER docintel_common</text>
+  <rect class="cmp" x="40" y="276" width="150" height="124" rx="10"/>
+  <text class="t" x="115" y="300" text-anchor="middle">Amazon SQS</text>
+  <text class="s" x="115" y="320" text-anchor="middle">ingest queue (SSE)</text>
+  <text class="s" x="115" y="338" text-anchor="middle">max 5 concurrent</text>
+  <text class="s" x="115" y="356" text-anchor="middle">3 retries → DLQ</text>
+  <text class="s" x="115" y="374" text-anchor="middle">DLQ alarm → SNS</text>
+
+  <rect class="cmp" x="210" y="276" width="300" height="124" rx="10"/>
+  <text class="t" x="360" y="298" text-anchor="middle">Processor Lambda (idempotent)</text>
+  <text class="s" x="224" y="318">• Textract text/forms/tables + confidence</text>
+  <text class="s" x="224" y="334">• Comprehend language, entities (+scores)</text>
+  <text class="s" x="224" y="350">• Bedrock summary · intent · category</text>
+  <text class="s" x="224" y="366">• Bedrock key dates &amp; actions (grounded)</text>
+  <text class="s" x="224" y="382">• review flags · chunks + embeddings · audit</text>
+  <path class="ln" d="M190,338 L208,338"/>
+
+  <rect class="cmp" x="540" y="276" width="270" height="124" rx="10"/>
+  <text class="t" x="675" y="298" text-anchor="middle">API Lambda</text>
+  <text class="s" x="554" y="318">• documents · upload URLs (v1 routes)</text>
+  <text class="s" x="554" y="334">• grounded ask + chat with history</text>
+  <text class="s" x="554" y="350">• fields, confidence, human verification</text>
+  <text class="s" x="554" y="366">• compare (difflib + Bedrock)</text>
+  <text class="s" x="554" y="382">• hybrid search · stats · audit</text>
+
+  <rect class="cmp" x="830" y="276" width="160" height="124" rx="10"/>
+  <text class="t" x="910" y="298" text-anchor="middle">Privacy Lambda</text>
+  <text class="s" x="844" y="320">• PII detection</text>
+  <text class="s" x="844" y="336">  (masked previews)</text>
+  <text class="s" x="844" y="354">• redacted copies</text>
+  <text class="s" x="844" y="370">  → redacted/ only</text>
+  <text class="s" x="844" y="388">• only role with PII API</text>
+
+  <rect class="cmp" x="1010" y="276" width="150" height="124" rx="10"/>
+  <text class="t" x="1085" y="298" text-anchor="middle">Export Lambda</text>
+  <text class="s" x="1024" y="320">• JSON · CSV · PDF</text>
+  <text class="s" x="1024" y="338">• AI values + human</text>
+  <text class="s" x="1024" y="354">  corrections side by side</text>
+  <text class="s" x="1024" y="372">• writes exports/ only</text>
+
+  <path class="ln" d="M675,232 L675,274"/>
+  <path class="ln" d="M910,232 L910,274"/>
+  <path class="ln" d="M1085,232 L1085,274"/>
+
+  <!-- Band D: data + AI -->
+  <text class="cap" x="40" y="440">DATA (ENCRYPTED AT REST)</text>
+  <rect class="data grp" x="40" y="448" width="520" height="200" rx="12"/>
+  <rect class="data" x="60" y="470" width="240" height="160" rx="10"/>
+  <text class="t" x="180" y="494" text-anchor="middle">Amazon S3 bucket</text>
+  <text class="s" x="74" y="516">uploads/  → only prefix that triggers</text>
+  <text class="s" x="74" y="532">                processing (90-day expiry)</text>
+  <text class="s" x="74" y="552">results/  extraction JSON (+pages, fields)</text>
+  <text class="s" x="74" y="572">redacted/ new redacted copies</text>
+  <text class="s" x="74" y="592">exports/  JSON/CSV/PDF (7-day expiry)</text>
+  <text class="s" x="74" y="614">originals are never modified</text>
+
+  <rect class="data" x="320" y="470" width="220" height="44" rx="8"/>
+  <text class="t" x="430" y="489" text-anchor="middle">DynamoDB · Documents</text>
+  <text class="s" x="430" y="505" text-anchor="middle">status, AI results, fields, review</text>
+  <rect class="data" x="320" y="526" width="220" height="44" rx="8"/>
+  <text class="t" x="430" y="545" text-anchor="middle">DynamoDB · Chunks</text>
+  <text class="s" x="430" y="561" text-anchor="middle">page-aware text + vectors (search)</text>
+  <rect class="data" x="320" y="582" width="220" height="48" rx="8"/>
+  <text class="t" x="430" y="600" text-anchor="middle">DynamoDB · App (single table)</text>
+  <text class="s" x="430" y="617" text-anchor="middle">chat · comparisons · verifications · audit</text>
+
+  <text class="cap" x="600" y="440">AI SERVICES (PAY PER USE)</text>
+  <rect class="ai grp" x="600" y="448" width="560" height="200" rx="12"/>
+  <rect class="ai" x="620" y="470" width="255" height="44" rx="8"/>
+  <text class="t" x="747" y="489" text-anchor="middle">Amazon Textract</text>
+  <text class="s" x="747" y="505" text-anchor="middle">OCR, forms, tables, confidence 0-100</text>
+  <rect class="ai" x="890" y="470" width="255" height="44" rx="8"/>
+  <text class="t" x="1017" y="489" text-anchor="middle">Amazon Comprehend</text>
+  <text class="s" x="1017" y="505" text-anchor="middle">language · entities · key phrases</text>
+  <rect class="ai" x="620" y="526" width="255" height="44" rx="8"/>
+  <text class="t" x="747" y="545" text-anchor="middle">Comprehend DetectPiiEntities</text>
+  <text class="s" x="747" y="561" text-anchor="middle">Privacy Lambda only</text>
+  <rect class="ai" x="890" y="526" width="255" height="44" rx="8"/>
+  <text class="t" x="1017" y="545" text-anchor="middle">Amazon Bedrock (Converse)</text>
+  <text class="s" x="1017" y="561" text-anchor="middle">summary · key dates · Q&amp;A · comparison</text>
+  <rect class="ai" x="620" y="582" width="255" height="48" rx="8"/>
+  <text class="t" x="747" y="601" text-anchor="middle">Bedrock Titan Embeddings v2</text>
+  <text class="s" x="747" y="618" text-anchor="middle">optional · 256-dim semantic retrieval</text>
+  <rect class="ai" x="890" y="582" width="255" height="48" rx="8" stroke-dasharray="4 3"/>
+  <text class="t" x="1017" y="601" text-anchor="middle">Output verification</text>
+  <text class="s" x="1017" y="618" text-anchor="middle">citations · verbatim quotes · grounded flags</text>
+
+  <!-- group-level interactions -->
+  <path class="big" d="M360,404 L360,446"/>
+  <text class="s" x="372" y="430">read / write</text>
+  <path class="big" d="M880,404 L880,446"/>
+  <text class="s" x="892" y="430">invoke (IAM-scoped)</text>
+  <!-- presigned upload path -->
+  <path class="ln" d="M40,214 L22,214 L22,540 L58,540"/>
+  <!-- S3 event flow -->
+  <path class="ev" d="M115,468 L115,404"/>
+  <text x="124" y="418" font-size="11" fill="#d9480f" font-weight="700">ObjectCreated (uploads/)</text>
+
+  <!-- Band E: ops -->
+  <text class="cap" x="40" y="680">OPERATIONS &amp; SECURITY</text>
+  <rect class="ops" x="40" y="688" width="1120" height="64" rx="10"/>
+  <text class="s" x="60" y="714">CloudWatch Logs (30 days, content-free) · structured audit lines · dashboard (Lambda, SQS, API, Bedrock tokens, audit failures) · 6 alarms → SNS email</text>
+  <text class="s" x="60" y="736">X-Ray tracing · least-privilege IAM per function · TLS-only bucket policy · SSE on S3/SQS/DynamoDB · DynamoDB TTL for chat + audit · all infrastructure in template.yaml (AWS SAM)</text>
+
+  <!-- legend -->
+  <rect class="edge" x="40" y="768" width="14" height="14" rx="3"/><text class="s" x="60" y="779">edge</text>
+  <rect class="cmp" x="110" y="768" width="14" height="14" rx="3"/><text class="s" x="130" y="779">compute / messaging</text>
+  <rect class="data" x="260" y="768" width="14" height="14" rx="3"/><text class="s" x="280" y="779">storage</text>
+  <rect class="ai" x="345" y="768" width="14" height="14" rx="3"/><text class="s" x="365" y="779">AI services</text>
+  <line x1="450" y1="775" x2="480" y2="775" stroke="#d9480f" stroke-width="2"/><text class="s" x="488" y="779">asynchronous ingestion event</text>
+</svg>

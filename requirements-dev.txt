@@ -1,0 +1,5 @@
+# Local development / CI only (the Lambda runtime already provides boto3).
+pytest>=8
+pyyaml>=6          # tests/test_template.py
+boto3>=1.34        # optional for unit tests (they use in-memory fakes), needed for scripts against AWS
+cfn-lint>=1.0

@@ -1,0 +1,50 @@
+.aws-sam/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Environment variables and credentials
+.env
+.env.*
+!.env.example
+.aws/
+*.pem
+*.key
+
+# Python environments and test artifacts
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local data and generated files
+*.db
+*.sqlite
+*.sqlite3
+uploads/
+exports/
+redacted/
+
+# Environment variables and credentials
+.env
+.env.*
+!.env.example
+.aws/
+*.pem
+*.key
+
+# Python environments and test artifacts
+venv/
+.coverage
+htmlcov/
+
+# Local databases and generated files
+*.db
+*.sqlite
+*.sqlite3
+uploads/
+exports/
+redacted/
